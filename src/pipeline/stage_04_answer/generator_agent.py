@@ -12,6 +12,55 @@ from src.config import (
 
 logger = logging.getLogger(__name__)
 
+# Repetition/frequency penalty guards against degenerate decoding loops
+# (verbatim phrase repetition, or drift into unrelated-language tokens) that
+# low-temperature sampling with no penalty is prone to getting stuck in.
+REPETITION_PENALTY = float(os.getenv("GENERATION_REPETITION_PENALTY", "1.2"))
+FREQUENCY_PENALTY = float(os.getenv("GENERATION_FREQUENCY_PENALTY", "0.4"))
+
+DEGENERATE_NGRAM_SIZE = 8
+DEGENERATE_NGRAM_MAX_REPEATS = 3
+
+# Scripts that are never legitimate in this system's output (Arabic or
+# English only, per build_prompt's two response templates). Their presence
+# -- even as a handful of stray characters inside one otherwise-normal
+# Arabic word -- is a reliable sign of decoding drift, unlike a low
+# Arabic-character *ratio*, which would also misfire on legitimate
+# English-language answers.
+_DISALLOWED_SCRIPT_RE = re.compile(
+    '['
+    '฀-๿'   # Thai
+    '一-鿿'   # CJK Unified Ideographs
+    '぀-ヿ'   # Hiragana + Katakana
+    '가-힣'   # Hangul syllables
+    'ऀ-ॿ'   # Devanagari
+    'Ѐ-ӿ'   # Cyrillic
+    ']'
+)
+
+
+def is_degenerate_output(text: str) -> bool:
+    """Flags garbled model output before it reaches a user: script drift
+    (e.g. Thai/CJK tokens leaking into an Arabic answer) or a repetition
+    loop (the same phrase repeated well beyond normal emphasis)."""
+    if not text or not text.strip():
+        return True
+
+    if _DISALLOWED_SCRIPT_RE.search(text):
+        return True
+
+    words = text.split()
+    if len(words) >= DEGENERATE_NGRAM_SIZE * DEGENERATE_NGRAM_MAX_REPEATS:
+        seen_counts: Dict[str, int] = {}
+        for i in range(len(words) - DEGENERATE_NGRAM_SIZE + 1):
+            gram = " ".join(words[i:i + DEGENERATE_NGRAM_SIZE])
+            count = seen_counts.get(gram, 0) + 1
+            seen_counts[gram] = count
+            if count >= DEGENERATE_NGRAM_MAX_REPEATS:
+                return True
+
+    return False
+
 
 _THINK_OPEN_RE = re.compile(r'<\s*(think|thinking|reasoning)\s*>', re.IGNORECASE)
 _THINK_CLOSE_RE = re.compile(r'</\s*(think|thinking|reasoning)\s*>', re.IGNORECASE)
@@ -198,6 +247,8 @@ class ResponseGeneratorAgent:
                 "stream": False,
                 "temperature": 0.1,
                 "max_tokens": NUM_PREDICT,
+                "repetition_penalty": REPETITION_PENALTY,
+                "frequency_penalty": FREQUENCY_PENALTY,
                 "chat_template_kwargs": {"enable_thinking": False},
             }
             async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=3.0)) as client:
@@ -205,7 +256,11 @@ class ResponseGeneratorAgent:
             if res.status_code == 200:
                 content = res.json()["choices"][0]["message"]["content"].strip()
                 if content:
-                    return clean_formatting(content), True
+                    cleaned = clean_formatting(content)
+                    if is_degenerate_output(cleaned):
+                        logger.warning("[GeneratorAgent] Discarding degenerate output (repetition loop or script drift): %r", cleaned[:200])
+                        return "", False
+                    return cleaned, True
             else:
                 logger.warning("[GeneratorAgent] vLLM returned %s: %s", res.status_code, res.text[:300])
         except Exception:
@@ -225,6 +280,8 @@ class ResponseGeneratorAgent:
                 "stream": True,
                 "temperature": 0.1,
                 "max_tokens": NUM_PREDICT,
+                "repetition_penalty": REPETITION_PENALTY,
+                "frequency_penalty": FREQUENCY_PENALTY,
                 "chat_template_kwargs": {"enable_thinking": False},
             }
             async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=3.0)) as client:
