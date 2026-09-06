@@ -40,6 +40,43 @@ DEFAULT_OUTPUT = Path(__file__).resolve().parent / "data" / "retrieval_golden.js
 MIN_CHUNK_CHARS = 60
 MAX_CONCURRENCY = 4
 
+# Prose-quality gate: rejects chunks that are mostly table/number dumps
+# (e.g. PDF-parsed tables reduced to bare "154 | 107.8 | 77 | | |" rows).
+# Such chunks have no real semantic content, so an LLM asked to invent a
+# question from them produces unanswerable golden rows (e.g. "what numbers
+# are in the text?") that no retriever -- correct or not -- could satisfy.
+MIN_LETTER_RATIO = 0.5
+MAX_DIGIT_RATIO = 0.3
+MAX_PIPE_RATIO = 0.03
+MIN_UNIQUE_WORD_RATIO = 0.3
+MIN_WORDS_FOR_REPETITION_CHECK = 10
+
+
+def is_low_quality_chunk(text: str) -> bool:
+    """True if `text` looks like table/number markup rather than real prose."""
+    length = len(text)
+    if length == 0:
+        return True
+
+    letters = sum(1 for c in text if c.isalpha())
+    digits = sum(1 for c in text if c.isdigit())
+    pipes = text.count('|')
+
+    if (letters / length) < MIN_LETTER_RATIO:
+        return True
+    if (digits / length) > MAX_DIGIT_RATIO:
+        return True
+    if (pipes / length) > MAX_PIPE_RATIO:
+        return True
+
+    words = text.split()
+    if len(words) >= MIN_WORDS_FOR_REPETITION_CHECK:
+        unique_ratio = len(set(words)) / len(words)
+        if unique_ratio < MIN_UNIQUE_WORD_RATIO:
+            return True
+
+    return False
+
 QUESTION_PROMPT = (
     "فيما يلي مقطع نصي من وثيقة رسمية لنقابة المهندسين الأردنيين.\n"
     "اكتب سؤالاً واحداً محدداً باللغة العربية تجيب عليه هذه الفقرة إجابة كاملة ومباشرة، "
@@ -93,11 +130,17 @@ async def main():
         return
 
     by_source = {}
+    quality_rejected = 0
     for cid, text, meta in zip(ids, docs, metas):
         if not text or len(text.strip()) < MIN_CHUNK_CHARS:
             continue
+        if is_low_quality_chunk(text):
+            quality_rejected += 1
+            continue
         source_id = (meta or {}).get("source_id", "unknown")
         by_source.setdefault(source_id, []).append((cid, text))
+
+    print(f"Rejected {quality_rejected} low-quality (table/number) chunks before sampling.")
 
     selected = []
     for source_id, chunks in by_source.items():
