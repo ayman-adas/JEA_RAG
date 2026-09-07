@@ -257,9 +257,13 @@ class ResponseGeneratorAgent:
                 content = res.json()["choices"][0]["message"]["content"].strip()
                 if content:
                     cleaned = clean_formatting(content)
+                    # TEMPORARILY DISABLED to test whether the user's own fix
+                    # eliminated degenerate output at the source, without the
+                    # safety net masking the result. is_degenerate_output()
+                    # is still defined below -- re-enable by restoring the
+                    # if-block that returns ("", False) on a positive match.
                     if is_degenerate_output(cleaned):
-                        logger.warning("[GeneratorAgent] Discarding degenerate output (repetition loop or script drift): %r", cleaned[:200])
-                        return "", False
+                        logger.warning("[GeneratorAgent] Would have discarded degenerate output (net disabled): %r", cleaned[:200])
                     return cleaned, True
             else:
                 logger.warning("[GeneratorAgent] vLLM returned %s: %s", res.status_code, res.text[:300])
