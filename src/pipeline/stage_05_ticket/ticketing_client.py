@@ -166,7 +166,9 @@ class TicketingClient:
             "ticketPriority": prio_upper,
             "skipWorkingHoursCheck": True,
         }
-        if session_id:
+        import re
+        uuid_re = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+        if session_id and uuid_re.match(session_id.strip()):
             payload["sessionId"] = session_id.strip()
 
         if phone:

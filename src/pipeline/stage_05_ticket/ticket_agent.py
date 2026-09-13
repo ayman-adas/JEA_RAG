@@ -284,7 +284,7 @@ class TicketIntakeAgent:
             "skipWorkingHoursCheck": True,
         }
 
-        if session_id:
+        if session_id and _UUID_RE.match(session_id.strip()):
             payload["sessionId"] = session_id.strip()
 
         if department:
@@ -294,7 +294,12 @@ class TicketIntakeAgent:
         if section:
             payload["section"] = section.strip()
 
-        phone = (user or {}).get("phone") or (user or {}).get("userPhoneNumber") or (user or {}).get("user_phone_number")
+        phone = (
+            (user or {}).get("phone")
+            or (user or {}).get("userPhoneNumber")
+            or (user or {}).get("user_phone_number")
+            or (user or {}).get("phoneNumber")
+        )
         if phone:
             payload["userPhoneNumber"] = str(phone).strip()
 
