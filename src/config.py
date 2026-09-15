@@ -36,7 +36,7 @@ BM25_INDEX_PATH = STORAGE_DIR / "bm25_index.pkl"
 CACHE_PERSIST_PATH = STORAGE_DIR / "semantic_cache.json"
 
 # Semantic Cache Settings
-CACHE_SIMILARITY_THRESHOLD = 0.88
+CACHE_SIMILARITY_THRESHOLD = 0.90
 CACHE_MAX_ENTRIES = 1000
 
 # Ensure storage directories exist

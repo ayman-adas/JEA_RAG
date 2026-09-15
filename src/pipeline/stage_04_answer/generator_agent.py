@@ -155,14 +155,22 @@ class ResponseGeneratorAgent:
         accumulated_chars = 0
         included_sources = []
 
+        seen_parent_ids = set()
         for src in sources:
+            parent_id = src.get("parent_id") or src.get("chunk_id")
+            if parent_id and parent_id in seen_parent_ids:
+                continue
+
             score = src.get("similarity_score", 0)
             rank = len(included_sources) + 1
             title = src.get("title", "وثيقة")
             section = src.get("section_title", "")
-            raw_text = src.get("text", "").strip()
+            raw_text = (src.get("parent_text") or src.get("text", "")).strip()
             if not raw_text:
                 continue
+
+            if parent_id:
+                seen_parent_ids.add(parent_id)
 
             header = f"[المصدر {rank}] {title}"
             if section:
@@ -177,13 +185,20 @@ class ResponseGeneratorAgent:
             accumulated_chars += len(block_str)
             included_sources.append(src)
 
-        if not included_sources:
-            return "", []
-
-        context_str = "\n" + ("=" * 50) + "\n" + "\n".join(context_blocks) + ("=" * 50)
-
         acc_lower = str(detected_accent).lower().strip()
         is_english = acc_lower in ("english", "en", "mixed") or acc_lower.startswith("en")
+
+        # No usable sources -- still let the LLM see the (empty) context and
+        # decide between "out of scope" and "not found in sources" per the
+        # prompt rules below, instead of returning "" here: an empty prompt
+        # short-circuits generation entirely and used to read as generation
+        # *failure*, sending even off-topic questions straight to a human
+        # ticket.
+        if not included_sources:
+            no_sources_note = "No relevant sources found." if is_english else "لا توجد مصادر ذات صلة."
+            context_str = "\n" + ("=" * 50) + f"\n{no_sources_note}\n" + ("=" * 50)
+        else:
+            context_str = "\n" + ("=" * 50) + "\n" + "\n".join(context_blocks) + ("=" * 50)
         if is_english:
             system_prompt = (
                 f"You are an Eng-Guild information assistant for the Jordan Engineers Association (JEA).\n"
@@ -194,7 +209,8 @@ class ResponseGeneratorAgent:
                 f"4. Language Matching: Respond strictly in professional English.\n"
                 f"5. Source Citation: Cite source numbers like [Source 1], [Source 2] next to facts.\n"
                 f"6. NO Chatbot Artifacts: NO generic sign-offs ('Let me know if you need anything else'), NO conversational filler.\n"
-                f"7. Accuracy: Do NOT invent facts. If missing, state: 'I couldn't find that information in the guild resources.'\n"
+                f"7. Accuracy: Do NOT invent facts. If the sources don't contain the answer, state exactly: \"I couldn't find that information in the guild resources.\"\n"
+                f"8. Out of Scope: If the user's question has nothing to do with JEA, its regulations, services, or the engineering profession (e.g. general trivia, personal questions, unrelated topics), do NOT attempt to force an answer from the sources. Respond with exactly this sentence and nothing else: \"I'm sorry, this question is outside my scope as the Jordan Engineers Association (JEA) information assistant. I can only help with JEA-related and engineering profession inquiries.\"\n"
             )
             full_prompt = (
                 f"{system_prompt}\n"
@@ -220,7 +236,8 @@ class ResponseGeneratorAgent:
                 f"4. {lang_instruction}\n"
                 f"5. التوثيق: اذكر رقم المصدر [المصدر N] بجانب كل معلومة واستشهاد.\n"
                 f"6. خلو من المظاهر الزائفة: يُحظر إضافة أي خاتمة روتينية أو جمل ترحيبية أو عرض مساعدة إضافية في النهاية (مثل 'تختص النقابة...' أو 'في حال وجود استفسارات').\n"
-                f"7. الدقة والاعتماد على المصادر: اجب اعتماداً على المعلومات الواردة في المصادر المرفقة بأعلاه، والخص كافة التفاصيل والخطوات والشروط المذكورة بدقة.\n"
+                f"7. الدقة والاعتماد على المصادر: اجب اعتماداً على المعلومات الواردة في المصادر المرفقة بأعلاه، والخص كافة التفاصيل والخطوات والشروط المذكورة بدقة. إذا لم تكن الإجابة موجودة في المصادر، اذكر حرفياً: \"عذراً، لم أتمكن من العثور على هذه المعلومة ضمن موارد النقابة المتاحة.\"\n"
+                f"8. خارج نطاق العمل: إذا كان سؤال المستخدم لا علاقة له إطلاقاً بنقابة المهندسين أو أنظمتها أو خدماتها أو المهنة الهندسية (مثل أسئلة عامة أو شخصية أو مواضيع غير متعلقة)، لا تحاول فرض إجابة من المصادر المرفقة. أجب حرفياً بهذه الجملة فقط: \"عذراً، هذا السؤال خارج نطاق عملي كمساعد معلومات نقابة المهندسين الأردنيين (JEA). أنا هنا للمساعدة في الاستفسارات المتعلقة بالنقابة وشؤون المهنة الهندسية فقط.\"\n"
             )
 
             full_prompt = (

@@ -67,7 +67,8 @@ class RAGChatbot:
             yield f"data: {json.dumps({'type': 'done', 'answer': answer_text, 'escalated': True, 'is_escalated': True, 'ticket_id': ticket_id, 'escalation_reason': 'user_intent', 'session_id': session_id, 'text_breakdown': 'Ticket Filed'}, ensure_ascii=False)}\n\n"
             return
 
-        cached_res = self.engine.cache.get(query) if not hist else None
+        query_vec = self.engine.retriever.embedder.embed_single_text(query) if hasattr(self.engine.retriever, "embedder") else None
+        cached_res = self.engine.cache.get(query, query_vec=query_vec, session_id=session_id) if not hist else None
         if cached_res:
             ans = cached_res.get("answer", "")
             if isinstance(ans, (tuple, list)):
@@ -103,8 +104,8 @@ class RAGChatbot:
             return
 
         query_obj = self.engine.nlp_pipeline.process(query)
-        fused_cands = self.engine.retriever.retrieve_hybrid(query_obj["normalized_text"], top_k=15)
-        reranked_cands = self.engine.reranker.apply_priority_boost(fused_cands)
+        fused_cands = self.engine.retriever.retrieve_hybrid(query_obj["normalized_text"], top_k=15, query_vec=query_vec)
+        reranked_cands = self.engine.reranker.rerank(query_obj["normalized_text"], fused_cands)
         conf_res = self.engine.confidence_eval.evaluate(reranked_cands, query_obj)
         route_res = self.engine.router.route(query_obj, conf_res)
         route = route_res["route"]
@@ -157,7 +158,7 @@ class RAGChatbot:
                     yield f"data: {json.dumps({'type': 'token', 'token': token}, ensure_ascii=False)}\n\n"
 
         if full_answer and not hist and not escalated:
-            self.engine.cache.put(query, full_answer, reranked_cands[:3])
+            self.engine.cache.put(query, full_answer, reranked_cands[:3], query_vec=query_vec, session_id=session_id)
 
         done_payload = json.dumps({
             "type": "done",

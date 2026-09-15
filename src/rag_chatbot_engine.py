@@ -75,7 +75,8 @@ class RAGChatbotEngine:
 
         # 1. Cache Stage
         with profiler.time_stage("cache"):
-            cached_res = self.cache.get(user_query) if not hist else None
+            query_vec = self.retriever.embedder.embed_single_text(user_query) if hasattr(self.retriever, "embedder") else None
+            cached_res = self.cache.get(user_query, query_vec=query_vec, session_id=session_id) if not hist else None
             if cached_res:
                 report = profiler.generate_report()
                 profiler.write_request_log(user_query, cached_res["answer"], cache_hit=True, route="CACHE")
@@ -112,7 +113,7 @@ class RAGChatbotEngine:
 
         # 6-9. Dense Vector & Sparse Hybrid Retrieval Stage
         with profiler.time_stage("bm25"):
-            fused_cands = self.retriever.retrieve_hybrid(query_obj["normalized_text"], top_k=15)
+            fused_cands = self.retriever.retrieve_hybrid(query_obj["normalized_text"], top_k=15, query_vec=query_vec)
 
         with profiler.time_stage("bge_m3"):
             pass
@@ -125,7 +126,7 @@ class RAGChatbotEngine:
 
         # 10. Reranker & Priority Boost Stage
         with profiler.time_stage("priority"):
-            reranked_cands = self.reranker.apply_priority_boost(fused_cands)
+            reranked_cands = self.reranker.rerank(query_obj["normalized_text"], fused_cands)
 
         # 11. CRAG & Confidence Stage
         with profiler.time_stage("crag"):
@@ -165,7 +166,7 @@ class RAGChatbotEngine:
         # Cache final answer if valid (single-turn only; never cache an
         # escalation reply -- it embeds a one-off ticket number)
         if answer_text and not hist and not escalated:
-            self.cache.put(user_query, answer_text, reranked_cands[:3])
+            self.cache.put(user_query, answer_text, reranked_cands[:3], query_vec=query_vec, session_id=session_id)
 
         profiler.record_stage("answer", profiler.stage_latencies["answer"], {"route": route})
         report = profiler.generate_report()
