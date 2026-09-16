@@ -1,7 +1,10 @@
 import sys
 import os
+import asyncio
 import logging
 from pathlib import Path
+from contextlib import asynccontextmanager
+from typing import List, Dict, Any, Optional
 
 # Force UTF-8 encoding on Windows console stdout/stderr
 if sys.platform == "win32":
@@ -10,29 +13,75 @@ if sys.platform == "win32":
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-# INFO-level app loggers (e.g. the generator/ticket agents) have no effect until
-# a handler is configured -- uvicorn only configures its own "uvicorn.*" loggers,
-# not the root logger.
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+from src.monitoring.structured_logger import setup_structured_logging
 
-from fastapi import FastAPI, HTTPException, Security
-from fastapi.security import APIKeyHeader
+# Configure structured logging
+setup_structured_logging(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    json_format=os.getenv("LOG_FORMAT", "text").lower() == "json",
+)
+
+logger = logging.getLogger(__name__)
+
+from fastapi import FastAPI, HTTPException, Security, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
-from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
-
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.gzip import GZipMiddleware
+
 from src.core.rag_engine import KnowledgeRetriever
 from src.cache_db.document_registry import DocumentRegistry
 from src.api.security import SecurityHeadersMiddleware, InMemoryRateLimiterMiddleware
+from src.services.http_client_pool import close_http_client_pools
+from src.api.middleware import (
+    http_exception_handler,
+    validation_exception_handler,
+    global_unhandled_exception_handler,
+)
+from src.api.response_envelope import ApiResponseEnvelope
 from .routes_chat import router as chat_router
 from .routes_admin import router as admin_router
 from .routes_admin_ui import router as admin_ui_router
 from .dependencies import USER_API_KEY, ADMIN_API_KEY
 
-app = FastAPI(title="Guild Knowledge Base RAG Chatbot UI", version="3.0.0")
+TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+UI_TEMPLATE_PATH = TEMPLATES_DIR / "chat_ui.html"
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Application lifespan context manager.
+    Warms up essential singletons on startup and gracefully closes HTTP pools on shutdown.
+    """
+    logger.info("🚀 Starting Eng-Guild Chatbot API Service (v3.0.0)...")
+    try:
+        # Pre-warm retriever and document registry in background thread
+        await asyncio.to_thread(KnowledgeRetriever)
+        await asyncio.to_thread(DocumentRegistry)
+        logger.info("✅ Singletons and Vector DB initialized successfully.")
+    except Exception as e:
+        logger.warning(f"⚠️ Non-fatal warming warning on startup: {e}")
+
+    yield
+
+    logger.info("🛑 Shutting down Eng-Guild Chatbot API Service. Releasing resources...")
+    await close_http_client_pools()
+    logger.info("✅ All connection pools closed cleanly.")
+
+
+app = FastAPI(
+    title="Guild Knowledge Base RAG Chatbot UI",
+    version="3.0.0",
+    lifespan=lifespan,
+)
+
+# Exception Handlers (Standardized ApiResponse format matching NestJS)
+app.add_exception_handler(HTTPException, http_exception_handler)
+app.add_exception_handler(RequestValidationError, validation_exception_handler)
+app.add_exception_handler(Exception, global_unhandled_exception_handler)
+
+# Middlewares
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(
@@ -48,608 +97,85 @@ app.add_middleware(
     expose_headers=["X-Request-ID", "X-Process-Time"],
 )
 
+# Routes
 app.include_router(chat_router, prefix="/api")
 app.include_router(admin_router, prefix="/api/admin")
 app.include_router(admin_ui_router)
+
 
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon():
     return Response(status_code=204)
 
+
 @app.get("/api/health/live")
 def health_live():
-    return {"status": "alive"}
+    return ApiResponseEnvelope.success_response({"status": "alive"})
+
 
 @app.get("/api/health/ready")
 async def health_ready():
     checks = {}
-    try:
+
+    def _check_sqlite():
         registry = DocumentRegistry()
         with registry._get_connection() as conn:
             conn.execute("SELECT 1;")
-        checks["sqlite"] = "healthy"
+        return "healthy"
+
+    def _check_vector_store():
+        retriever = KnowledgeRetriever()
+        chunk_count = retriever.collection.count()
+        return f"healthy ({chunk_count} chunks)"
+
+    try:
+        checks["sqlite"] = await asyncio.to_thread(_check_sqlite)
     except Exception as e:
         checks["sqlite"] = f"unhealthy: {e}"
 
     try:
-        retriever = KnowledgeRetriever()
-        chunk_count = retriever.collection.count()
-        checks["vector_store"] = f"healthy ({chunk_count} chunks)"
+        checks["vector_store"] = await asyncio.to_thread(_check_vector_store)
     except Exception as e:
         checks["vector_store"] = f"unhealthy: {e}"
 
     is_healthy = all("unhealthy" not in v for v in checks.values())
     status_code = 200 if is_healthy else 503
-    import json
-    return Response(
-        content=json.dumps({"status": "ready" if is_healthy else "degraded", "checks": checks}),
-        status_code=status_code,
-        media_type="application/json",
+    payload = ApiResponseEnvelope.success_response(
+        {"status": "ready" if is_healthy else "degraded", "checks": checks}
     )
+    return JSONResponse(content=payload, status_code=status_code)
+
 
 @app.get("/api/health")
 async def health():
-    try:
+    def _count():
         retriever = KnowledgeRetriever()
-        chunk_count = retriever.collection.count()
-        return {"status": "ok", "chunks": chunk_count}
+        return retriever.collection.count()
+
+    try:
+        chunk_count = await asyncio.to_thread(_count)
+        return ApiResponseEnvelope.success_response({"status": "ok", "chunks": chunk_count})
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 
+
 @app.get("/api/stats")
-def get_stats():
-    registry = DocumentRegistry()
-    retriever = KnowledgeRetriever()
-    total_docs = len(registry.list_documents())
-    total_chunks = retriever.collection.count()
-    return {"total_documents": total_docs, "total_chunks": total_chunks}
+async def get_stats():
+    def _fetch_stats():
+        registry = DocumentRegistry()
+        retriever = KnowledgeRetriever()
+        total_docs = len(registry.list_documents())
+        total_chunks = retriever.collection.count()
+        return {"total_documents": total_docs, "total_chunks": total_chunks}
+
+    stats = await asyncio.to_thread(_fetch_stats)
+    return ApiResponseEnvelope.success_response(stats)
+
 
 @app.get("/", response_class=HTMLResponse)
 def serve_ui():
     default_key = USER_API_KEY or ADMIN_API_KEY or ""
-    return HTML_CONTENT.replace("{{DEFAULT_USER_KEY}}", default_key)
-
-HTML_CONTENT = r"""<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>نقابة المهندسين الأردنيين — المساعد الذكي (RAG Chatbot)</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --bg-gradient: linear-gradient(135deg, #0b0f19 0%, #111827 50%, #0b0f19 100%);
-            --header-bg: rgba(17, 24, 39, 0.95);
-            --card-bg: rgba(30, 41, 59, 0.7);
-            --card-border: rgba(255, 255, 255, 0.08);
-            --user-msg-bg: linear-gradient(135deg, #4f46e5 0%, #6366f1 100%);
-            --bot-msg-bg: rgba(30, 41, 59, 0.85);
-            --accent-glow: #6366f1;
-            --teal-accent: #14b8a6;
-            --text-main: #f8fafc;
-            --text-muted: #94a3b8;
-            --accordion-bg: rgba(15, 23, 42, 0.6);
-        }
-
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-            font-family: 'Tajawal', 'Outfit', sans-serif;
-        }
-
-        body {
-            background: var(--bg-gradient);
-            color: var(--text-main);
-            height: 100vh;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-        }
-
-        header {
-            background: var(--header-bg);
-            backdrop-filter: blur(16px);
-            border-bottom: 1px solid var(--card-border);
-            padding: 1.2rem 2rem;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            text-align: center;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
-            z-index: 100;
-            flex-direction: column;
-        }
-
-        .header-brand {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 0.3rem;
-        }
-
-        .header-brand h1 {
-            font-size: 1.65rem;
-            font-weight: 800;
-            background: linear-gradient(135deg, #ffffff 0%, #cbd5e1 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            letter-spacing: -0.5px;
-            display: flex;
-            align-items: center;
-            gap: 0.6rem;
-        }
-
-        .header-brand h1::before {
-            content: none;
-        }
-
-        .header-brand p {
-            font-size: 0.9rem;
-            color: var(--text-muted);
-            font-weight: 500;
-        }
-
-        main {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            max-width: 1000px;
-            width: 100%;
-            margin: 0 auto;
-            padding: 1rem 1.5rem;
-            position: relative;
-            height: calc(100vh - 85px);
-        }
-
-        #chat-feed {
-            flex: 1;
-            overflow-y: auto;
-            padding: 1rem 0.5rem;
-            display: flex;
-            flex-direction: column;
-            gap: 1.5rem;
-            scroll-behavior: smooth;
-        }
-
-        #chat-feed::-webkit-scrollbar {
-            width: 6px;
-        }
-        #chat-feed::-webkit-scrollbar-thumb {
-            background: rgba(255, 255, 255, 0.15);
-            border-radius: 4px;
-        }
-
-        .welcome-card {
-            background: var(--card-bg);
-            border: 1px solid var(--card-border);
-            border-radius: 20px;
-            padding: 2.5rem 2rem;
-            text-align: center;
-            margin: auto 0;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-            backdrop-filter: blur(12px);
-        }
-
-        .welcome-card h2 {
-            font-size: 1.6rem;
-            font-weight: 700;
-            color: #fff;
-            margin-bottom: 0.75rem;
-        }
-
-        /* TEST_QUESTIONS_BANK */
-        .welcome-card p {
-            color: var(--text-muted);
-            font-size: 0.98rem;
-            margin-bottom: 1.5rem;
-            line-height: 1.6;
-        }
-
-        .suggestions {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 0.75rem;
-            text-align: right;
-        }
-
-        .chip {
-            background: rgba(255, 255, 255, 0.04);
-            border: 1px solid var(--card-border);
-            padding: 0.85rem 1.1rem;
-            border-radius: 12px;
-            cursor: pointer;
-            transition: all 0.25s ease;
-            font-size: 0.88rem;
-            color: var(--text-main);
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-
-        .chip:hover {
-            background: rgba(99, 102, 241, 0.15);
-            border-color: var(--accent-glow);
-            transform: translateY(-2px);
-        }
-
-        .message-row {
-            display: flex;
-            flex-direction: column;
-            gap: 0.4rem;
-            opacity: 0;
-            transform: translateY(10px);
-            animation: fadeIn 0.3s forwards ease-out;
-        }
-
-        @keyframes fadeIn {
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        .message-row.user {
-            align-items: flex-start;
-        }
-
-        .message-row.bot {
-            align-items: flex-end;
-        }
-
-        .bubble {
-            max-width: 85%;
-            padding: 1.1rem 1.4rem;
-            border-radius: 18px;
-            font-size: 0.95rem;
-            line-height: 1.65;
-            white-space: pre-wrap;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
-            position: relative;
-        }
-
-        .message-row.user .bubble {
-            background: var(--user-msg-bg);
-            color: #fff;
-            border-bottom-right-radius: 4px;
-        }
-
-        .message-row.bot .bubble {
-            background: var(--bot-msg-bg);
-            border: 1px solid var(--card-border);
-            color: var(--text-main);
-            border-bottom-left-radius: 4px;
-            backdrop-filter: blur(8px);
-        }
-
-        .meta-container {
-            margin-top: 0.6rem;
-            width: 100%;
-            max-width: 85%;
-        }
-
-        details.accordion {
-            background: var(--accordion-bg);
-            border: 1px solid var(--card-border);
-            border-radius: 10px;
-            font-size: 0.82rem;
-            color: var(--text-muted);
-            overflow: hidden;
-            transition: all 0.2s;
-        }
-
-        details.accordion summary {
-            padding: 0.6rem 0.9rem;
-            cursor: pointer;
-            user-select: none;
-            font-weight: 600;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        details.accordion summary:hover {
-            color: var(--text-main);
-            background: rgba(255, 255, 255, 0.02);
-        }
-
-        .accordion-content {
-            padding: 0.8rem 1rem;
-            border-top: 1px solid var(--card-border);
-            display: flex;
-            flex-direction: column;
-            gap: 0.6rem;
-        }
-
-        .source-item {
-            background: rgba(255, 255, 255, 0.03);
-            border-radius: 6px;
-            padding: 0.5rem 0.75rem;
-            border-right: 3px solid var(--teal-accent);
-        }
-
-        .source-title {
-            font-weight: 700;
-            color: #fff;
-            margin-bottom: 0.2rem;
-        }
-
-        .source-snippet {
-            font-size: 0.78rem;
-            color: #cbd5e1;
-        }
-
-        .input-bar {
-            background: var(--header-bg);
-            border: 1px solid var(--card-border);
-            border-radius: 16px;
-            padding: 0.6rem;
-            display: flex;
-            align-items: center;
-            gap: 0.6rem;
-            margin-top: auto;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
-            backdrop-filter: blur(16px);
-        }
-
-        .input-bar textarea {
-            flex: 1;
-            background: transparent;
-            border: none;
-            outline: none;
-            color: var(--text-main);
-            font-size: 0.95rem;
-            padding: 0.5rem 0.8rem;
-            resize: none;
-            height: 46px;
-            max-height: 120px;
-        }
-
-        .input-bar button {
-            background: var(--user-msg-bg);
-            color: #fff;
-            border: none;
-            width: 44px;
-            height: 44px;
-            border-radius: 12px;
-            cursor: pointer;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            transition: all 0.2s ease;
-            flex-shrink: 0;
-        }
-
-        .input-bar button:hover {
-            transform: scale(1.05);
-            box-shadow: 0 0 15px rgba(99, 102, 241, 0.5);
-        }
-
-        .input-bar button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-            transform: none;
-        }
-
-        .spinner {
-            width: 18px;
-            height: 18px;
-            border: 2px solid rgba(255, 255, 255, 0.3);
-            border-top-color: #fff;
-            border-radius: 50%;
-            animation: spin 0.8s linear infinite;
-        }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-    </style>
-</head>
-<body>
-
-<header>
-    <div class="header-brand">
-        <h1>نقابة المهندسين الأردنيين</h1>
-        <p>المساعد الذكي للخدمات والقوانين النقابية</p>
-    </div>
-</header>
-
-<main>
-    <div id="chat-feed">
-        <div class="welcome-card" id="welcome-box">
-            <h2>أهلاً بك في المساعد الذكي لنقابة المهندسين</h2>
-            <p>أنا هنا لمساعدتك في الاستفسار عن متطلبات الانتساب، رسوم الاشتراكات، أنظمة التقاعد والتأمين الصحي، والقوانين النقابية.</p>
-            <div class="suggestions">
-                <div class="chip" onclick="sendSuggestion('شو أوراق الانتساب للنقابة؟')">
-                    <span>شو أوراق الانتساب للنقابة؟</span>
-                </div>
-                <div class="chip" onclick="sendSuggestion('قديش رسم الاشتراك السنوي؟')">
-                    <span>قديش رسم الاشتراك السنوي؟</span>
-                </div>
-                <div class="chip" onclick="sendSuggestion('كيف اشترك بصندوق التقاعد؟')">
-                    <span>كيف اشترك بصندوق التقاعد؟</span>
-                </div>
-                <div class="chip" onclick="sendSuggestion('فتح تذكرة دعم مشكلة مالية')">
-                    <span>فتح تذكرة دعم (مشكلة مالية)</span>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <div class="input-bar">
-        <textarea id="user-input" dir="auto" placeholder="اكتب سؤالك هنا..." rows="1" oninput="updateInputDirection(this)" onkeydown="handleKeyDown(event)"></textarea>
-        <button id="send-btn" onclick="submitQuery()">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <line x1="22" y1="2" x2="11" y2="13"></line>
-                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-            </svg>
-        </button>
-    </div>
-</main>
-
-<script>
-    const DEFAULT_KEY = "{{DEFAULT_USER_KEY}}";
-
-    function updateInputDirection(el) {
-        const val = el.value.trim();
-        if (!val) {
-            el.setAttribute('dir', 'auto');
-            el.style.textAlign = 'right';
-            return;
-        }
-        const hasArabic = /[\u0600-\u06FF]/.test(val);
-        const hasLatin = /[a-zA-Z]/.test(val);
-        const firstChar = val.charAt(0);
-        if (/[\u0600-\u06FF]/.test(firstChar) || (hasArabic && !hasLatin)) {
-            el.setAttribute('dir', 'rtl');
-            el.style.textAlign = 'right';
-        } else if (/[a-zA-Z]/.test(firstChar) || (hasLatin && !hasArabic)) {
-            el.setAttribute('dir', 'ltr');
-            el.style.textAlign = 'left';
-        } else {
-            el.setAttribute('dir', 'auto');
-        }
-    }
-
-    function sendSuggestion(text) {
-        const el = document.getElementById('user-input');
-        el.value = text;
-        updateInputDirection(el);
-        submitQuery();
-    }
-
-    function handleKeyDown(e) {
-        if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            submitQuery();
-        }
-    }
-
-    async function submitQuery() {
-        const inputEl = document.getElementById('user-input');
-        const query = inputEl.value.trim();
-        if (!query) return;
-
-        const welcomeBox = document.getElementById('welcome-box');
-        if (welcomeBox) welcomeBox.style.display = 'none';
-
-        const feed = document.getElementById('chat-feed');
-
-        // Render User Message
-        const userRow = document.createElement('div');
-        userRow.className = 'message-row user';
-        userRow.innerHTML = `<div class="bubble" dir="auto">${escapeHtml(query)}</div>`;
-        feed.appendChild(userRow);
-
-        inputEl.value = '';
-        inputEl.style.height = '46px';
-        updateInputDirection(inputEl);
-
-        // Render Bot Placeholder
-        const botRow = document.createElement('div');
-        botRow.className = 'message-row bot';
-        
-        const bubble = document.createElement('div');
-        bubble.className = 'bubble';
-        bubble.setAttribute('dir', 'auto');
-        bubble.innerHTML = '<div class="spinner"></div>';
-        botRow.appendChild(bubble);
-
-        const metaContainer = document.createElement('div');
-        metaContainer.className = 'meta-container';
-        botRow.appendChild(metaContainer);
-
-        feed.appendChild(botRow);
-        feed.scrollTop = feed.scrollHeight;
-
-        const sendBtn = document.getElementById('send-btn');
-        sendBtn.disabled = true;
-
-        try {
-            const resp = await fetch('/api/chat/stream', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-API-Key': DEFAULT_KEY
-                },
-                body: JSON.stringify({ query: query })
-            });
-
-            if (!resp.ok) {
-                bubble.innerText = 'حدث خطأ في الاتصال بالخادم.';
-                sendBtn.disabled = false;
-                return;
-            }
-
-            const reader = resp.body.getReader();
-            const decoder = new TextDecoder('utf-8');
-            let accumulatedText = '';
-            let isFirstToken = true;
-
-            while (true) {
-                const { value, done } = await reader.read();
-                if (done) break;
-
-                const chunk = decoder.decode(value, { stream: true });
-                const lines = chunk.split(/\n\n/);
-
-                for (const line of lines) {
-                    if (line.startsWith('data: ')) {
-                        try {
-                            const data = JSON.parse(line.substring(6));
-                            if (data.type === 'meta') {
-                                renderMetadata(metaContainer, data);
-                            } else if (data.type === 'token') {
-                                if (isFirstToken) {
-                                    bubble.innerText = '';
-                                    isFirstToken = false;
-                                }
-                                accumulatedText += data.token;
-                                bubble.innerText = accumulatedText;
-                                feed.scrollTop = feed.scrollHeight;
-                            } else if (data.type === 'done') {
-                                if (!accumulatedText && data.answer) {
-                                    bubble.innerText = data.answer;
-                                }
-                            }
-                        } catch (err) {}
-                    }
-                }
-            }
-        } catch (err) {
-            bubble.innerText = 'حدث خطأ غير متوقع أثناء معالجة الطلب.';
-        } finally {
-            sendBtn.disabled = false;
-        }
-    }
-
-    function renderMetadata(container, data) {
-        if (!data.sources || data.sources.length === 0) return;
-        const sourcesHtml = data.sources.map(s => `
-            <div class="source-item">
-                <div class="source-title">${escapeHtml(s.title || 'وثيقة')}</div>
-                <div class="source-snippet">${escapeHtml((s.text || '').substring(0, 120))}...</div>
-            </div>
-        `).join('');
-
-        container.innerHTML = `
-            <details class="accordion">
-                <summary>
-                    <span>المصادر المرجعية المستخرجة (${data.sources.length})</span>
-                    <span>${data.cache_hit ? '⚡ ذاكرة سريعة' : '🔍 استرجاع هجين'}</span>
-                </summary>
-                <div class="accordion-content">
-                    ${sourcesHtml}
-                </div>
-            </details>
-        `;
-    }
-
-    function escapeHtml(text) {
-        const div = document.createElement('div');
-        div.innerText = text;
-        return div.innerHTML;
-    }
-</script>
-</body>
-</html>
-"""
+    if UI_TEMPLATE_PATH.exists():
+        content = UI_TEMPLATE_PATH.read_text(encoding="utf-8")
+        return content.replace("{{DEFAULT_USER_KEY}}", default_key)
+    return HTMLResponse("<h1>JEA Chatbot API is online. UI template not found.</h1>", status_code=200)

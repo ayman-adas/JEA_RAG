@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Tuple, AsyncGenerator, Optional
 from pathlib import Path
 
 import asyncio
+from src.pipeline.stage_04_answer.answer_router import StructuredAnswerTemplates
 
 def clean_formatting(text: str) -> str:
     if not text:

@@ -68,6 +68,8 @@ def verify_authenticated_client(
     )
 
 
+from src.monitoring.structured_logger import request_id_ctx
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """
     Attaches security headers to all responses (Fastify / Helmet equivalent):
@@ -76,7 +78,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     - X-Frame-Options: SAMEORIGIN
     - X-XSS-Protection: 1; mode=block
     - Referrer-Policy: strict-origin-when-cross-origin
-    - Request Process Time & Correlation ID
+    - Request Process Time & Correlation ID Tracing
     """
     async def dispatch(self, request: Request, call_next):
         start_time = time.perf_counter()
@@ -86,35 +88,48 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         if not request_id:
             request_id = secrets.token_hex(8)
 
-        response: Response = await call_next(request)
+        # Bind to contextvar for structured log tracing in downstream async tasks
+        token = request_id_ctx.set(request_id)
+        try:
+            response: Response = await call_next(request)
 
-        # Performance & Tracing headers
-        process_time_ms = (time.perf_counter() - start_time) * 1000
-        response.headers["X-Process-Time"] = f"{process_time_ms:.2f}ms"
-        response.headers["X-Request-ID"] = request_id
+            # Performance & Tracing headers
+            process_time_ms = (time.perf_counter() - start_time) * 1000
+            response.headers["X-Process-Time"] = f"{process_time_ms:.2f}ms"
+            response.headers["X-Request-ID"] = request_id
 
-        # Security headers
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "SAMEORIGIN"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+            # Security headers
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "SAMEORIGIN"
+            response.headers["X-XSS-Protection"] = "1; mode=block"
+            response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+            response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
 
-        return response
+            return response
+        finally:
+            request_id_ctx.reset(token)
 
 
 class InMemoryRateLimiterMiddleware(BaseHTTPMiddleware):
     """
-    Sliding window in-memory rate limiter per IP address.
+    Bounded sliding-window in-memory rate limiter per IP address.
     Protects LLM & RAG pipeline against denial-of-service and runaway loops.
     Exempts internal bypass tokens and health checks.
+    Periodically purges inactive IPs to prevent memory growth.
     """
-    def __init__(self, app, max_requests: int = 120, window_seconds: int = 60):
+    def __init__(self, app, max_requests: int = 120, window_seconds: int = 60, max_tracked_ips: int = 10000):
         super().__init__(app)
         self.max_requests = max_requests
         self.window_seconds = window_seconds
-        # client_ip -> list of timestamps
+        self.max_tracked_ips = max_tracked_ips
         self.requests: Dict[str, list] = defaultdict(list)
+        self.last_cleanup_time = time.time()
+
+    def _purge_stale_ips(self, window_start: float):
+        """Purges IPs with no requests in the current window to prevent memory leaks."""
+        stale_ips = [ip for ip, timestamps in self.requests.items() if not timestamps or timestamps[-1] <= window_start]
+        for ip in stale_ips:
+            self.requests.pop(ip, None)
 
     async def dispatch(self, request: Request, call_next):
         # Exempt health and static routes
@@ -137,7 +152,12 @@ class InMemoryRateLimiterMiddleware(BaseHTTPMiddleware):
         now = time.time()
         window_start = now - self.window_seconds
 
-        # Clean old timestamps
+        # Periodic memory cleanup every 60 seconds or if map exceeds capacity
+        if now - self.last_cleanup_time > 60 or len(self.requests) > self.max_tracked_ips:
+            self._purge_stale_ips(window_start)
+            self.last_cleanup_time = now
+
+        # Clean old timestamps for current client
         client_history = [ts for ts in self.requests[client_ip] if ts > window_start]
         self.requests[client_ip] = client_history
 

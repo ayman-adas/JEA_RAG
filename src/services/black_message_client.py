@@ -6,6 +6,7 @@ from src.config import (
     JEA_BACKEND_BASE_URL,
     INTERNAL_BYPASS_TOKEN,
 )
+from src.services.http_client_pool import get_sync_http_client, get_async_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -61,24 +62,7 @@ class BlackMessageClient:
         session_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Synchronously flags or unflags a message as a black message.
-
-        Args:
-            message_id: UUID of the message to update.
-            is_black: True to flag as black message, False to unflag.
-            reason: Optional moderation note or rule violation description.
-            session_id: Optional session UUID if session-scoped route is desired.
-
-        Returns:
-            Dictionary containing updated message metadata:
-            {
-                "id": str,
-                "sessionId": str,
-                "isBlackMessage": bool,
-                "senderType": str,
-                "updatedAt": str
-            }
-            or None on failure.
+        Synchronously flags or unflags a message as a black message using connection pool.
         """
         url = self._resolve_url(message_id, session_id)
         payload: Dict[str, Any] = {
@@ -88,34 +72,34 @@ class BlackMessageClient:
             payload["reason"] = str(reason)[:500]
 
         try:
-            with httpx.Client(timeout=self.timeout) as client:
-                response = client.patch(url, json=payload, headers=self.headers)
-                if response.status_code == 200:
-                    envelope = response.json()
-                    data = envelope.get("data") if isinstance(envelope, dict) and "data" in envelope else envelope
-                    logger.info(
-                        "[BlackMessageClient] Successfully set isBlackMessage=%s on message %s",
-                        is_black,
-                        message_id,
-                    )
-                    return data
-                elif response.status_code == 401:
-                    logger.error(
-                        "[BlackMessageClient] Unauthorized (401) calling %s - check INTERNAL_BYPASS_TOKEN",
-                        url,
-                    )
-                elif response.status_code == 404:
-                    logger.warning(
-                        "[BlackMessageClient] Message %s not found (404) in live chat database",
-                        message_id,
-                    )
-                else:
-                    logger.warning(
-                        "[BlackMessageClient] Error status %s from %s: %s",
-                        response.status_code,
-                        url,
-                        response.text[:200],
-                    )
+            client = get_sync_http_client(timeout=self.timeout)
+            response = client.patch(url, json=payload, headers=self.headers)
+            if response.status_code == 200:
+                envelope = response.json()
+                data = envelope.get("data") if isinstance(envelope, dict) and "data" in envelope else envelope
+                logger.info(
+                    "[BlackMessageClient] Successfully set isBlackMessage=%s on message %s",
+                    is_black,
+                    message_id,
+                )
+                return data
+            elif response.status_code == 401:
+                logger.error(
+                    "[BlackMessageClient] Unauthorized (401) calling %s - check INTERNAL_BYPASS_TOKEN",
+                    url,
+                )
+            elif response.status_code == 404:
+                logger.warning(
+                    "[BlackMessageClient] Message %s not found (404) in live chat database",
+                    message_id,
+                )
+            else:
+                logger.warning(
+                    "[BlackMessageClient] Error status %s from %s: %s",
+                    response.status_code,
+                    url,
+                    response.text[:200],
+                )
         except Exception as e:
             logger.warning("[BlackMessageClient] Connection error calling %s: %s", url, e)
 
@@ -129,8 +113,7 @@ class BlackMessageClient:
         session_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Asynchronously flags or unflags a message as a black message.
-        Ideal for use in FastAPI async route handlers and async agent workflows.
+        Asynchronously flags or unflags a message as a black message using connection pool.
         """
         url = self._resolve_url(message_id, session_id)
         payload: Dict[str, Any] = {
@@ -140,34 +123,34 @@ class BlackMessageClient:
             payload["reason"] = str(reason)[:500]
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.patch(url, json=payload, headers=self.headers)
-                if response.status_code == 200:
-                    envelope = response.json()
-                    data = envelope.get("data") if isinstance(envelope, dict) and "data" in envelope else envelope
-                    logger.info(
-                        "[BlackMessageClient] Successfully (async) set isBlackMessage=%s on message %s",
-                        is_black,
-                        message_id,
-                    )
-                    return data
-                elif response.status_code == 401:
-                    logger.error(
-                        "[BlackMessageClient] Unauthorized (401) calling %s - check INTERNAL_BYPASS_TOKEN",
-                        url,
-                    )
-                elif response.status_code == 404:
-                    logger.warning(
-                        "[BlackMessageClient] Message %s not found (404) in live chat database",
-                        message_id,
-                    )
-                else:
-                    logger.warning(
-                        "[BlackMessageClient] Error status %s from %s: %s",
-                        response.status_code,
-                        url,
-                        response.text[:200],
-                    )
+            client = get_async_http_client(timeout=self.timeout)
+            response = await client.patch(url, json=payload, headers=self.headers)
+            if response.status_code == 200:
+                envelope = response.json()
+                data = envelope.get("data") if isinstance(envelope, dict) and "data" in envelope else envelope
+                logger.info(
+                    "[BlackMessageClient] Successfully (async) set isBlackMessage=%s on message %s",
+                    is_black,
+                    message_id,
+                )
+                return data
+            elif response.status_code == 401:
+                logger.error(
+                    "[BlackMessageClient] Unauthorized (401) calling %s - check INTERNAL_BYPASS_TOKEN",
+                    url,
+                )
+            elif response.status_code == 404:
+                logger.warning(
+                    "[BlackMessageClient] Message %s not found (404) in live chat database",
+                    message_id,
+                )
+            else:
+                logger.warning(
+                    "[BlackMessageClient] Error status %s from %s: %s",
+                    response.status_code,
+                    url,
+                    response.text[:200],
+                )
         except Exception as e:
             logger.warning("[BlackMessageClient] Async connection error calling %s: %s", url, e)
 

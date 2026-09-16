@@ -12,11 +12,14 @@ from src.pipeline.stage_02_retrieve.bm25_retriever import BM25Retriever
 from src.pipeline.stage_02_retrieve.rrf_fusion import RRFFusion
 from src.pipeline.stage_03_verify_rerank.reranker import PriorityReranker
 from src.pipeline.stage_03_verify_rerank.confidence import DeterministicConfidenceEvaluator
-from src.pipeline.stage_04_answer.answer_router import AnswerRouter
+from src.pipeline.stage_04_answer.answer_router import AnswerRouter, StructuredAnswerTemplates
 from src.pipeline.stage_04_answer.generator_agent import ResponseGeneratorAgent
 from src.pipeline.stage_02_retrieve.retriever_agent import RetrieverAgent
 from src.pipeline.stage_05_ticket.ticket_agent import TicketIntakeAgent
 from src.pipeline.stage_00_moderation.black_message_agent import BlackMessageAgent
+
+
+from src.monitoring.structured_logger import request_id_ctx
 
 
 class RAGChatbotEngine:
@@ -44,7 +47,7 @@ class RAGChatbotEngine:
                             user: Optional[Dict[str, str]] = None,
                             session_id: Optional[str] = None,
                             message_id: Optional[str] = None) -> Dict[str, Any]:
-        request_id = RequestTracer.generate_request_id()
+        request_id = request_id_ctx.get() or RequestTracer.generate_request_id()
         profiler = PipelineProfiler(request_id)
         hist = history or []
 

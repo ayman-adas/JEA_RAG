@@ -7,6 +7,7 @@ from src.config import (
     JEA_BACKEND_BASE_URL,
     INTERNAL_BYPASS_TOKEN,
 )
+from src.services.http_client_pool import get_sync_http_client, get_async_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -105,29 +106,29 @@ class TicketingClient:
 
         for url in endpoints:
             try:
-                with httpx.Client(timeout=4.0) as client:
-                    response = client.get(url, headers=self.headers)
-                    if response.status_code == 200:
-                        envelope = response.json()
-                        data = (
-                            envelope.get("data", envelope)
-                            if isinstance(envelope, dict) and "data" in envelope
-                            else envelope
+                client = get_sync_http_client(timeout=4.0)
+                response = client.get(url, headers=self.headers)
+                if response.status_code == 200:
+                    envelope = response.json()
+                    data = (
+                        envelope.get("data", envelope)
+                        if isinstance(envelope, dict) and "data" in envelope
+                        else envelope
+                    )
+                    if isinstance(data, dict) and ("departments" in data or "sectors" in data):
+                        self._sectors_cache = {
+                            "sectors": data.get("sectors") or data.get("departments", []),
+                            "departments": data.get("departments") or data.get("sectors", []),
+                            "sections": data.get("sections", []),
+                            "departmentSections": data.get("departmentSections", {}),
+                        }
+                        self._last_sectors_fetch_time = now
+                        logger.info(
+                            "[TicketingClient] Successfully fetched sectors structure: %d departments, %d sections",
+                            len(self._sectors_cache["departments"]),
+                            len(self._sectors_cache["sections"]),
                         )
-                        if isinstance(data, dict) and ("departments" in data or "sectors" in data):
-                            self._sectors_cache = {
-                                "sectors": data.get("sectors") or data.get("departments", []),
-                                "departments": data.get("departments") or data.get("sectors", []),
-                                "sections": data.get("sections", []),
-                                "departmentSections": data.get("departmentSections", {}),
-                            }
-                            self._last_sectors_fetch_time = now
-                            logger.info(
-                                "[TicketingClient] Successfully fetched sectors structure: %d departments, %d sections",
-                                len(self._sectors_cache["departments"]),
-                                len(self._sectors_cache["sections"]),
-                            )
-                            return self._sectors_cache
+                        return self._sectors_cache
             except Exception as e:
                 logger.debug("[TicketingClient] Failed querying %s: %s", url, e)
 
@@ -183,28 +184,28 @@ class TicketingClient:
 
 
         try:
-            with httpx.Client(timeout=5.0) as client:
-                response = client.post(url, json=payload, headers=self.headers)
-                if response.status_code in [200, 201]:
-                    envelope = response.json()
-                    ticket_data = (
-                        envelope.get("data")
-                        if isinstance(envelope, dict) and "data" in envelope
-                        else envelope
+            client = get_sync_http_client(timeout=5.0)
+            response = client.post(url, json=payload, headers=self.headers)
+            if response.status_code in [200, 201]:
+                envelope = response.json()
+                ticket_data = (
+                    envelope.get("data")
+                    if isinstance(envelope, dict) and "data" in envelope
+                    else envelope
+                )
+                if ticket_data:
+                    ticket_id = ticket_data.get("id") or ticket_data.get("ticket_id")
+                    logger.info(
+                        "[TicketingClient] Successfully created ticket in backend: ID=%s",
+                        ticket_id,
                     )
-                    if ticket_data:
-                        ticket_id = ticket_data.get("id") or ticket_data.get("ticket_id")
-                        logger.info(
-                            "[TicketingClient] Successfully created ticket in backend: ID=%s",
-                            ticket_id,
-                        )
-                    return ticket_data
-                else:
-                    logger.warning(
-                        "[TicketingClient] Failed to create ticket: status=%s, body=%s",
-                        response.status_code,
-                        response.text[:250],
-                    )
+                return ticket_data
+            else:
+                logger.warning(
+                    "[TicketingClient] Failed to create ticket: status=%s, body=%s",
+                    response.status_code,
+                    response.text[:250],
+                )
         except Exception as e:
             logger.warning("[TicketingClient] Error calling backend internal ticket creation endpoint: %s", e)
 
