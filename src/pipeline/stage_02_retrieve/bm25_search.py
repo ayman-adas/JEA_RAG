@@ -10,8 +10,8 @@ from src.config import BM25_INDEX_PATH
 def normalize_arabic_text(text: str) -> str:
     if not text:
         return ""
-    text = re.sub(r'[\u0617-\u061A\u064B-\u0652]', '', text)
-    text = re.sub(r'\u0640', '', text)
+    text = re.sub(r'[ؗ-ًؚ-ْ]', '', text)
+    text = re.sub(r'ـ', '', text)
     text = re.sub(r'[إأآ]', 'ا', text)
     text = re.sub(r'ى', 'ي', text)
     text = re.sub(r'ة', 'ه', text)
@@ -34,6 +34,7 @@ class BM25Indexer:
         self.avgdl: float = 0.0
         self.doc_freqs: List[Dict[str, int]] = []
         self.idf: Dict[str, float] = {}
+        self.inverted_index: Dict[str, List[int]] = {}
         self.load()
 
     def add_chunks(self, chunks: List[Dict[str, Any]]):
@@ -54,12 +55,18 @@ class BM25Indexer:
         if N == 0:
             self.avgdl = 0.0
             self.idf = {}
+            self.inverted_index = {}
             return
         self.avgdl = sum(self.doc_len) / float(N)
         df: Dict[str, int] = {}
-        for freqs in self.doc_freqs:
+        self.inverted_index = {}
+        for idx, freqs in enumerate(self.doc_freqs):
             for term in freqs.keys():
                 df[term] = df.get(term, 0) + 1
+                if term not in self.inverted_index:
+                    self.inverted_index[term] = []
+                self.inverted_index[term].append(idx)
+
         self.idf = {}
         for term, freq in df.items():
             idf_val = math.log((N - freq + 0.5) / (freq + 0.5) + 1.0)
@@ -69,19 +76,31 @@ class BM25Indexer:
         q_tokens = tokenize_arabic(query)
         if not q_tokens or not self.corpus:
             return []
-        scores: List[float] = [0.0] * len(self.corpus)
+
+        # Find matching document indices via inverted index instead of
+        # scanning every doc_freqs entry per query term.
+        matching_indices = set()
         for t in q_tokens:
-            if t not in self.idf:
+            if t in self.inverted_index:
+                matching_indices.update(self.inverted_index[t])
+
+        if not matching_indices:
+            return []
+
+        scores: Dict[int, float] = {idx: 0.0 for idx in matching_indices}
+        for t in q_tokens:
+            if t not in self.idf or t not in self.inverted_index:
                 continue
             idf_val = self.idf[t]
-            for idx, freqs in enumerate(self.doc_freqs):
-                if t in freqs:
-                    tf = freqs[t]
-                    dl = self.doc_len[idx]
-                    denom = tf + self.k1 * (1.0 - self.b + self.b * (dl / (self.avgdl or 1.0)))
-                    score = idf_val * (tf * (self.k1 + 1.0)) / denom
-                    scores[idx] += score
-        results = [(self.corpus[i], scores[i]) for i in range(len(scores)) if scores[i] > 0]
+            for idx in self.inverted_index[t]:
+                freqs = self.doc_freqs[idx]
+                tf = freqs[t]
+                dl = self.doc_len[idx]
+                denom = tf + self.k1 * (1.0 - self.b + self.b * (dl / (self.avgdl or 1.0)))
+                score = idf_val * (tf * (self.k1 + 1.0)) / denom
+                scores[idx] += score
+
+        results = [(self.corpus[i], score) for i, score in scores.items() if score > 0]
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_k]
 
@@ -93,7 +112,8 @@ class BM25Indexer:
             "doc_len": self.doc_len,
             "avgdl": self.avgdl,
             "doc_freqs": self.doc_freqs,
-            "idf": self.idf
+            "idf": self.idf,
+            "inverted_index": self.inverted_index
         }
         with open(self.index_path, "wb") as f:
             pickle.dump(data, f)
@@ -109,5 +129,8 @@ class BM25Indexer:
                     self.avgdl = data.get("avgdl", 0.0)
                     self.doc_freqs = data.get("doc_freqs", [])
                     self.idf = data.get("idf", {})
+                    self.inverted_index = data.get("inverted_index", {})
+                    if not self.inverted_index and self.doc_freqs:
+                        self._recalc_index()
             except Exception:
                 pass
