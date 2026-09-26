@@ -282,6 +282,7 @@ class TicketIntakeAgent:
             "content": content,
             "ticketPriority": ticket_priority,
             "skipWorkingHoursCheck": True,
+            "sourceType": "AI",
         }
 
         if session_id and _UUID_RE.match(session_id.strip()):

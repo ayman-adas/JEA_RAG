@@ -166,6 +166,7 @@ class TicketingClient:
             "content": final_content,
             "ticketPriority": prio_upper,
             "skipWorkingHoursCheck": True,
+            "sourceType": "AI",
         }
         import re
         uuid_re = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
