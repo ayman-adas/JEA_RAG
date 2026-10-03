@@ -283,18 +283,14 @@ class ResponseGeneratorAgent:
             return "", False
 
         try:
-            payload = {
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                "temperature": 0.1,
-                "max_tokens": NUM_PREDICT,
-                "repetition_penalty": REPETITION_PENALTY,
-                "frequency_penalty": FREQUENCY_PENALTY,
-                "chat_template_kwargs": {"enable_thinking": False},
-            }
+            payload = self._build_payload(prompt, stream=False)
+            if self.provider == "vllm":
+                payload["repetition_penalty"] = REPETITION_PENALTY
+                payload["frequency_penalty"] = FREQUENCY_PENALTY
+            elif self.provider == "openai":
+                payload["frequency_penalty"] = FREQUENCY_PENALTY
             async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=3.0)) as client:
-                res = await client.post(self.vllm_url, json=payload)
+                res = await client.post(self.vllm_url, json=payload, headers=self.headers)
             if res.status_code == 200:
                 content = res.json()["choices"][0]["message"]["content"].strip()
                 if content:
@@ -320,18 +316,14 @@ class ResponseGeneratorAgent:
             return
 
         try:
-            payload = {
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": True,
-                "temperature": 0.1,
-                "max_tokens": NUM_PREDICT,
-                "repetition_penalty": REPETITION_PENALTY,
-                "frequency_penalty": FREQUENCY_PENALTY,
-                "chat_template_kwargs": {"enable_thinking": False},
-            }
+            payload = self._build_payload(prompt, stream=True)
+            if self.provider == "vllm":
+                payload["repetition_penalty"] = REPETITION_PENALTY
+                payload["frequency_penalty"] = FREQUENCY_PENALTY
+            elif self.provider == "openai":
+                payload["frequency_penalty"] = FREQUENCY_PENALTY
             async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=3.0)) as client:
-                async with client.stream("POST", self.vllm_url, json=payload) as res:
+                async with client.stream("POST", self.vllm_url, json=payload, headers=self.headers) as res:
                     if res.status_code != 200:
                         body = await res.aread()
                         if res.status_code == 401:

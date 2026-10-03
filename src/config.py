@@ -1,5 +1,7 @@
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+# Regular HTTPS downloads. The Xet transfer path was stalling model files at 0 bytes.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -110,6 +112,25 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+# GPT-Live-1 voice agent. The spoken layer is gpt-live-1; tool delegation uses
+# gpt-6-luna. Knowledge answers still go through the RAG pipeline on OPENAI_MODEL.
+GPT_LIVE_MODEL = os.getenv("GPT_LIVE_MODEL", "gpt-live-1")
+GPT_LIVE_VOICE = os.getenv("GPT_LIVE_VOICE", "cedar")
+GPT_LIVE_DELEGATION_MODEL = os.getenv("GPT_LIVE_DELEGATION_MODEL", "gpt-6-luna")
+GPT_LIVE_SAMPLE_RATE = int(os.getenv("GPT_LIVE_SAMPLE_RATE", "24000"))
+
+
+def effective_live_model() -> str:
+    return os.getenv("GPT_LIVE_MODEL", GPT_LIVE_MODEL).strip() or "gpt-live-1"
+
+
+def effective_live_voice() -> str:
+    return os.getenv("GPT_LIVE_VOICE", GPT_LIVE_VOICE).strip() or "cedar"
+
+
+def effective_delegation_model() -> str:
+    return os.getenv("GPT_LIVE_DELEGATION_MODEL", GPT_LIVE_DELEGATION_MODEL).strip() or "gpt-6-luna"
 
 # Multi-Stage Ingestion Pipeline & Ollama Settings
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")

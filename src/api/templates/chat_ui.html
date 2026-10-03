@@ -314,6 +314,35 @@
             transform: none;
         }
 
+        .input-bar button.voice-btn {
+            background: rgba(20, 184, 166, 0.18);
+            border: 1px solid rgba(20, 184, 166, 0.45);
+            color: #5eead4;
+        }
+
+        .input-bar button.voice-btn.active {
+            background: linear-gradient(135deg, #ef4444 0%, #b91c1c 100%);
+            border-color: transparent;
+            color: #fff;
+            box-shadow: 0 0 16px rgba(239, 68, 68, 0.45);
+        }
+
+        .voice-status {
+            text-align: center;
+            font-size: 0.82rem;
+            color: var(--text-muted);
+            min-height: 1.2rem;
+            margin-bottom: 0.45rem;
+        }
+
+        .voice-status.live {
+            color: #5eead4;
+        }
+
+        .voice-status.error {
+            color: #fca5a5;
+        }
+
         .spinner {
             width: 18px;
             height: 18px;
@@ -359,8 +388,17 @@
         </div>
     </div>
 
+    <div id="voice-status" class="voice-status"></div>
     <div class="input-bar">
-        <textarea id="user-input" dir="auto" placeholder="اكتب سؤالك هنا..." rows="1" oninput="updateInputDirection(this)" onkeydown="handleKeyDown(event)"></textarea>
+        <textarea id="user-input" dir="auto" placeholder="اكتب سؤالك هنا، أو اضغط الميكروفون للتحدث..." rows="1" oninput="updateInputDirection(this)" onkeydown="handleKeyDown(event)"></textarea>
+        <button id="voice-btn" class="voice-btn" type="button" onclick="toggleVoice()" title="محادثة صوتية">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                <line x1="12" y1="19" x2="12" y2="23"></line>
+                <line x1="8" y1="23" x2="16" y2="23"></line>
+            </svg>
+        </button>
         <button id="send-btn" onclick="submitQuery()">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <line x1="22" y1="2" x2="11" y2="13"></line>
@@ -526,6 +564,209 @@
                 </div>
             </details>
         `;
+    }
+
+    let voiceWs = null;
+    let voiceAudioCtx = null;
+    let voiceStream = null;
+    let voiceProcessor = null;
+    let voiceNextPlay = 0;
+    let voiceActive = false;
+    let voiceLastError = '';
+    let skipNextAgentTranscript = false;
+
+    function setVoiceStatus(text, cls) {
+        const el = document.getElementById('voice-status');
+        el.textContent = text || '';
+        el.className = 'voice-status' + (cls ? ' ' + cls : '');
+    }
+
+    function hideWelcome() {
+        const welcomeBox = document.getElementById('welcome-box');
+        if (welcomeBox) welcomeBox.style.display = 'none';
+    }
+
+    function appendChatBubble(role, text) {
+        hideWelcome();
+        const feed = document.getElementById('chat-feed');
+        const row = document.createElement('div');
+        row.className = 'message-row ' + (role === 'user' ? 'user' : 'bot');
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+        bubble.setAttribute('dir', 'auto');
+        bubble.innerText = text;
+        row.appendChild(bubble);
+        const meta = document.createElement('div');
+        meta.className = 'meta-container';
+        row.appendChild(meta);
+        feed.appendChild(row);
+        feed.scrollTop = feed.scrollHeight;
+        return { row, bubble, meta };
+    }
+
+    function toggleVoice() {
+        if (voiceActive) stopVoice();
+        else startVoice();
+    }
+
+    async function startVoice() {
+        const btn = document.getElementById('voice-btn');
+        btn.disabled = true;
+        voiceLastError = '';
+        setVoiceStatus('جارٍ الاتصال بالمساعد الصوتي...', '');
+
+        try {
+            voiceAudioCtx = new AudioContext();
+            voiceStream = await navigator.mediaDevices.getUserMedia({
+                audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+            });
+
+            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const key = encodeURIComponent(DEFAULT_KEY || '');
+            voiceWs = new WebSocket(proto + '//' + location.host + '/ws/voice?key=' + key);
+
+            voiceWs.onopen = () => {
+                voiceActive = true;
+                btn.disabled = false;
+                btn.classList.add('active');
+                setVoiceStatus('المكالمة شغالة — تقدر تحكي مباشرة', 'live');
+                startMicCapture();
+            };
+
+            voiceWs.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                if (msg.type === 'audio') {
+                    playVoiceAudio(msg.data);
+                } else if (msg.type === 'transcript') {
+                    if (!msg.text) return;
+                    if (msg.role === 'agent' && skipNextAgentTranscript) {
+                        skipNextAgentTranscript = false;
+                        return;
+                    }
+                    appendChatBubble(msg.role === 'user' ? 'user' : 'bot', msg.text);
+                } else if (msg.type === 'answer') {
+                    const parts = appendChatBubble('bot', msg.answer || '...');
+                    if (msg.escalated && msg.ticket_id) {
+                        parts.bubble.innerText += '\n\nرقم التذكرة: ' + msg.ticket_id;
+                    }
+                    renderMetadata(parts.meta, { sources: msg.sources || [], cache_hit: false });
+                    skipNextAgentTranscript = true;
+                } else if (msg.type === 'status') {
+                    if (msg.status === 'error') {
+                        voiceLastError = msg.error || 'صار خطأ بالمكالمة';
+                        setVoiceStatus(voiceLastError, 'error');
+                    } else if (msg.status === 'ended' && !voiceLastError) {
+                        setVoiceStatus('انتهت المكالمة', '');
+                    }
+                }
+            };
+
+            voiceWs.onclose = () => {
+                if (!voiceActive && !voiceAudioCtx) return;
+                const failed = Boolean(voiceLastError) || !voiceActive;
+                finishVoice(
+                    voiceLastError || (voiceActive ? 'انتهت المكالمة' : 'تعذر الاتصال بالمساعد الصوتي'),
+                    failed
+                );
+            };
+            voiceWs.onerror = () => {
+                if (voiceActive) setVoiceStatus('انقطع الاتصال الصوتي', 'error');
+            };
+        } catch (err) {
+            finishVoice('تعذر تشغيل الميكروفون: ' + err.message, true);
+        }
+    }
+
+    function startMicCapture() {
+        const source = voiceAudioCtx.createMediaStreamSource(voiceStream);
+        voiceProcessor = voiceAudioCtx.createScriptProcessor(4096, 1, 1);
+        const inputRate = voiceAudioCtx.sampleRate;
+        const silent = voiceAudioCtx.createGain();
+        silent.gain.value = 0;
+
+        voiceProcessor.onaudioprocess = (e) => {
+            if (!voiceWs || voiceWs.readyState !== WebSocket.OPEN) return;
+            const pcm = downsample(e.inputBuffer.getChannelData(0), inputRate, 24000);
+            const int16 = new Int16Array(pcm.length);
+            for (let i = 0; i < pcm.length; i++) {
+                int16[i] = Math.max(-32768, Math.min(32767, pcm[i] * 32768));
+            }
+            voiceWs.send(JSON.stringify({ type: 'audio', data: bytesToBase64(int16) }));
+        };
+
+        source.connect(voiceProcessor);
+        voiceProcessor.connect(silent);
+        silent.connect(voiceAudioCtx.destination);
+    }
+
+    function downsample(float32, inRate, outRate) {
+        if (inRate === outRate) return float32;
+        const ratio = inRate / outRate;
+        const newLen = Math.max(1, Math.floor(float32.length / ratio));
+        const out = new Float32Array(newLen);
+        for (let i = 0; i < newLen; i++) {
+            const idx = i * ratio;
+            const i0 = Math.floor(idx);
+            const i1 = Math.min(i0 + 1, float32.length - 1);
+            const frac = idx - i0;
+            out[i] = float32[i0] * (1 - frac) + float32[i1] * frac;
+        }
+        return out;
+    }
+
+    function bytesToBase64(int16) {
+        const bytes = new Uint8Array(int16.buffer);
+        let binary = '';
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+        }
+        return btoa(binary);
+    }
+
+    function playVoiceAudio(b64Data) {
+        if (!voiceAudioCtx) return;
+        const bytes = atob(b64Data);
+        const arr = new Int16Array(bytes.length / 2);
+        for (let i = 0; i < arr.length; i++) {
+            arr[i] = bytes.charCodeAt(i * 2) | (bytes.charCodeAt(i * 2 + 1) << 8);
+        }
+        const float32 = new Float32Array(arr.length);
+        for (let i = 0; i < arr.length; i++) float32[i] = arr[i] / 32768;
+        const buffer = voiceAudioCtx.createBuffer(1, float32.length, 24000);
+        buffer.getChannelData(0).set(float32);
+        const source = voiceAudioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(voiceAudioCtx.destination);
+        const now = voiceAudioCtx.currentTime;
+        if (voiceNextPlay < now) voiceNextPlay = now;
+        source.start(voiceNextPlay);
+        voiceNextPlay += buffer.duration;
+    }
+
+    function stopVoice() {
+        const socket = voiceWs;
+        voiceActive = false;
+        if (socket && socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: 'end' }));
+            socket.close();
+        }
+        finishVoice('انتهت المكالمة');
+    }
+
+    function finishVoice(message, isError) {
+        if (voiceProcessor) { voiceProcessor.disconnect(); voiceProcessor = null; }
+        if (voiceStream) { voiceStream.getTracks().forEach(t => t.stop()); voiceStream = null; }
+        if (voiceAudioCtx) { voiceAudioCtx.close(); voiceAudioCtx = null; }
+        voiceWs = null;
+        voiceActive = false;
+        voiceNextPlay = 0;
+        const btn = document.getElementById('voice-btn');
+        if (btn) {
+            btn.disabled = false;
+            btn.classList.remove('active');
+        }
+        if (message) setVoiceStatus(message, isError ? 'error' : '');
     }
 
     function escapeHtml(text) {

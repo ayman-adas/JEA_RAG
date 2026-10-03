@@ -42,6 +42,7 @@ from src.api.response_envelope import ApiResponseEnvelope
 from .routes_chat import router as chat_router
 from .routes_admin import router as admin_router
 from .routes_admin_ui import router as admin_ui_router
+from .routes_voice import router as voice_router
 from .dependencies import USER_API_KEY, ADMIN_API_KEY
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
@@ -56,8 +57,16 @@ async def lifespan(app: FastAPI):
     """
     logger.info("🚀 Starting Eng-Guild Chatbot API Service (v3.0.0)...")
     try:
-        # Pre-warm retriever and document registry in background thread
-        await asyncio.to_thread(KnowledgeRetriever)
+        def _warm_rag():
+            from src.api.routes_chat import get_chatbot
+            engine = get_chatbot().engine
+            engine.nlp_pipeline.arat5_rewriter._lazy_load()
+            engine.reranker._lazy_load()
+            engine.retriever.embedder.embed_single_text("انتساب النقابة")
+
+        # Load the same chatbot the voice tool uses, including rewriter and reranker,
+        # so the first spoken question does not stall on a model download.
+        await asyncio.to_thread(_warm_rag)
         await asyncio.to_thread(DocumentRegistry)
         logger.info("✅ Singletons and Vector DB initialized successfully.")
     except Exception as e:
@@ -101,6 +110,7 @@ app.add_middleware(
 app.include_router(chat_router, prefix="/api")
 app.include_router(admin_router, prefix="/api/admin")
 app.include_router(admin_ui_router)
+app.include_router(voice_router)
 
 
 @app.get("/favicon.ico", include_in_schema=False)

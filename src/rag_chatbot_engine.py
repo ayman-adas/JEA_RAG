@@ -191,13 +191,20 @@ class RAGChatbotEngine:
                     detected_accent=query_obj["language"]
                 )
                 answer_text = None
+                generation_ok = False
                 if prompt_str:
                     gen_out = await self.generator.generate(prompt_str)
-                    answer_text = gen_out[0] if isinstance(gen_out, tuple) else gen_out
+                    if isinstance(gen_out, tuple):
+                        answer_text, generation_ok = gen_out[0], bool(gen_out[1]) if len(gen_out) > 1 else bool(gen_out[0])
+                    else:
+                        answer_text = gen_out
+                        generation_ok = bool(gen_out)
 
-                # No grounded answer -> escalate to a human ticket, in this
-                # same turn, rather than a dead end.
-                if not answer_text:
+                # A failed model call is not a missing answer. Opening a ticket
+                # here would file one for every question whenever generation errors.
+                if prompt_str and not generation_ok:
+                    answer_text = answer_text or "تعذر توليد الإجابة حالياً. حاول مرة ثانية بعد قليل."
+                elif not answer_text:
                     ticket_id, answer_text = await asyncio.to_thread(
                         self.ticket_agent.escalate, "low_confidence", user_query, hist, user, session_id
                     )
