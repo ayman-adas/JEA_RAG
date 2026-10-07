@@ -26,6 +26,10 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.28.0
 websockets>=13.0
 
+# WebRTC & VoIP Calling
+aiortc>=1.15.0
+av>=17.1.0
+
 # Testing & Quality Assurance
 pytest>=8.0.0
 httpx>=0.27.0

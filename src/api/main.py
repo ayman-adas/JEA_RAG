@@ -43,6 +43,7 @@ from .routes_chat import router as chat_router
 from .routes_admin import router as admin_router
 from .routes_admin_ui import router as admin_ui_router
 from .routes_voice import router as voice_router
+from .whatsapp_call_router import router as whatsapp_call_router
 from .dependencies import USER_API_KEY, ADMIN_API_KEY
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
@@ -75,6 +76,11 @@ async def lifespan(app: FastAPI):
     yield
 
     logger.info("🛑 Shutting down Eng-Guild Chatbot API Service. Releasing resources...")
+    try:
+        from src.voice.whatsapp_webrtc import get_whatsapp_webrtc_manager
+        await get_whatsapp_webrtc_manager().shutdown()
+    except Exception as e:
+        logger.warning(f"WhatsApp WebRTC shutdown warning: {e}")
     await close_http_client_pools()
     logger.info("✅ All connection pools closed cleanly.")
 
@@ -111,6 +117,7 @@ app.include_router(chat_router, prefix="/api")
 app.include_router(admin_router, prefix="/api/admin")
 app.include_router(admin_ui_router)
 app.include_router(voice_router)
+app.include_router(whatsapp_call_router)
 
 
 @app.get("/favicon.ico", include_in_schema=False)

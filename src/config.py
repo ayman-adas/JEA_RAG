@@ -132,6 +132,18 @@ def effective_live_voice() -> str:
 def effective_delegation_model() -> str:
     return os.getenv("GPT_LIVE_DELEGATION_MODEL", GPT_LIVE_DELEGATION_MODEL).strip() or "gpt-6-luna"
 
+# WhatsApp VoIP Calling Settings (Meta Cloud API + Native WebRTC / Option 3)
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", os.getenv("WHATSAPP_ACCESS_TOKEN", ""))
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
+WHATSAPP_WEBHOOK_VERIFY_TOKEN = os.getenv("WHATSAPP_WEBHOOK_VERIFY_TOKEN", os.getenv("WHATSAPP_VERIFY_TOKEN", ""))
+WHATSAPP_GRAPH_API_VERSION = os.getenv("WHATSAPP_GRAPH_API_VERSION", "v21.0")
+WHATSAPP_GRAPH_API_BASE_URL = os.getenv("WHATSAPP_GRAPH_API_BASE_URL", "https://graph.facebook.com").rstrip("/")
+WHATSAPP_STUN_SERVER = os.getenv("WHATSAPP_STUN_SERVER", "stun:stun.l.google.com:19302")
+WHATSAPP_TURN_SERVER = os.getenv("WHATSAPP_TURN_SERVER", "")
+WHATSAPP_TURN_USERNAME = os.getenv("WHATSAPP_TURN_USERNAME", "")
+WHATSAPP_TURN_CREDENTIAL = os.getenv("WHATSAPP_TURN_CREDENTIAL", "")
+
 # Multi-Stage Ingestion Pipeline & Ollama Settings
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_URL = os.getenv("OLLAMA_URL", f"{OLLAMA_BASE_URL}/api/generate")
